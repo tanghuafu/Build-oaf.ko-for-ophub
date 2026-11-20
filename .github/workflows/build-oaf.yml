@@ -1,0 +1,99 @@
+name: Build oaf.ko for ophub 6.18.64
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: '目标架构 (arm64/arm)'
+        required: false
+        default: 'arm64'
+        type: choice
+        options:
+          - arm64
+          - arm
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          if [ "${{ github.event.inputs.arch }}" = "arm64" ]; then
+            sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
+            echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+            echo "KERNEL_ARCH=arm64" >> $GITHUB_ENV
+          else
+            sudo apt-get install -y gcc-arm-linux-gnueabihf
+            echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> $GITHUB_ENV
+            echo "KERNEL_ARCH=arm" >> $GITHUB_ENV
+          fi
+          sudo apt-get install -y make bison flex libssl-dev libelf-dev bc wget tar gzip
+
+      - name: Download ophub kernel headers
+        run: |
+          wget https://github.com/ophub/kernel/releases/download/kernel_stable/header-6.18.64-ophub.tar.gz
+          mkdir -p kernel-headers
+          tar -xzf header-6.18.64-ophub.tar.gz -C kernel-headers
+          find kernel-headers -maxdepth 4 -type d | head -50
+
+      - name: Auto detect kernel build directory
+        run: |
+          KDIR=""
+          for d in $(find kernel-headers -type d); do
+            if [ -f "$d/Makefile" ] && [ -d "$d/include/linux" ]; then
+              KDIR="$d"
+              break
+            fi
+          done
+          if [ -z "$KDIR" ]; then
+            KDIR=$(find kernel-headers -path "*/scripts/Makefile.build" -printf '%h\n' | head -1 | sed 's|/scripts||')
+          fi
+          if [ -z "$KDIR" ]; then
+            echo "未找到内核构建目录，完整结构如下："
+            find kernel-headers -maxdepth 5 | head -100
+            exit 1
+          fi
+          echo "检测到内核目录: $KDIR"
+          echo "KDIR=$KDIR" >> $GITHUB_ENV
+
+      - name: Prepare kernel build environment
+        run: |
+          cd $KDIR
+          if [ ! -f .config ]; then
+            CFG=$(find . -name "config-*" | head -1)
+            if [ -n "$CFG" ]; then cp "$CFG" .config; fi
+          fi
+          make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
+          make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules_prepare
+
+      - name: Clone OpenAppFilter
+        run: |
+          git clone --depth 1 https://github.com/destan19/OpenAppFilter.git oaf-src || \
+          git clone --depth 1 https://gitee.com/listenerln/OpenAppFilter.git oaf-src
+
+      - name: Auto locate OAF module source
+        run: |
+          OAF_DIR=$(dirname $(find oaf-src -name "app_filter.c" | head -1))
+          echo "OAF模块目录: $OAF_DIR"
+          echo "OAF_DIR=$OAF_DIR" >> $GITHUB_ENV
+
+      - name: Build oaf.ko
+        run: |
+          cd $OAF_DIR
+          make -C $GITHUB_WORKSPACE/$KDIR M=$(pwd) \
+            ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules 2>&1 | tee build.log
+          ls -lh oaf.ko
+
+      - name: Upload oaf.ko
+        uses: actions/upload-artifact@v4
+        with:
+          name: oaf-ko-6.18.59-ophub-${{ github.event.inputs.arch }}
+          path: |
+            ${{ env.OAF_DIR }}/oaf.ko
+            ${{ env.OAF_DIR }}/build.log
+          if-no-files-found: error
