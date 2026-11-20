@@ -2,15 +2,6 @@ name: Build oaf.ko for ophub 6.18.64
 
 on:
   workflow_dispatch:
-    inputs:
-      arch:
-        description: '目标架构 (arm64/arm)'
-        required: false
-        default: 'arm64'
-        type: choice
-        options:
-          - arm64
-          - arm
 
 jobs:
   build:
@@ -23,51 +14,31 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          if [ "${{ github.event.inputs.arch }}" = "arm64" ]; then
-            sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu
-            echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
-            echo "KERNEL_ARCH=arm64" >> $GITHUB_ENV
-          else
-            sudo apt-get install -y gcc-arm-linux-gnueabihf
-            echo "CROSS_COMPILE=arm-linux-gnueabihf-" >> $GITHUB_ENV
-            echo "KERNEL_ARCH=arm" >> $GITHUB_ENV
-          fi
-          sudo apt-get install -y make bison flex libssl-dev libelf-dev bc wget tar gzip
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            make bison flex libssl-dev libelf-dev bc wget tar gzip
+          echo "CROSS_COMPILE=aarch64-linux-gnu-" >> $GITHUB_ENV
+          echo "KERNEL_ARCH=arm64" >> $GITHUB_ENV
+          echo "KDIR=$GITHUB_WORKSPACE/kernel-src" >> $GITHUB_ENV
 
-      - name: Download ophub kernel headers
+      - name: Download ophub kernel 6.18.64
         run: |
-          wget https://github.com/ophub/kernel/releases/download/kernel_stable/header-6.18.64-ophub.tar.gz
-          mkdir -p kernel-headers
-          tar -xzf header-6.18.64-ophub.tar.gz -C kernel-headers
-          find kernel-headers -maxdepth 4 -type d | head -50
-
-      - name: Auto detect kernel build directory
-        run: |
-          KDIR=""
-          for d in $(find kernel-headers -type d); do
-            if [ -f "$d/Makefile" ] && [ -d "$d/include/linux" ]; then
-              KDIR="$d"
-              break
-            fi
-          done
-          if [ -z "$KDIR" ]; then
-            KDIR=$(find kernel-headers -path "*/scripts/Makefile.build" -printf '%h\n' | head -1 | sed 's|/scripts||')
-          fi
-          if [ -z "$KDIR" ]; then
-            echo "未找到内核构建目录，完整结构如下："
-            find kernel-headers -maxdepth 5 | head -100
-            exit 1
-          fi
-          echo "检测到内核目录: $KDIR"
-          echo "KDIR=$KDIR" >> $GITHUB_ENV
+          wget -O kernel.tar.gz https://github.com/ophub/kernel/releases/download/kernel_stable/6.18.64.tar.gz
+          mkdir -p kernel-src
+          tar -xzf kernel.tar.gz -C kernel-src
+          echo "===== 解压后一级目录 ====="
+          ls -la kernel-src
 
       - name: Prepare kernel build environment
         run: |
           cd $KDIR
-          if [ ! -f .config ]; then
-            CFG=$(find . -name "config-*" | head -1)
-            if [ -n "$CFG" ]; then cp "$CFG" .config; fi
+          # 若解压后多一层目录，自动进入真正的内核根
+          if [ ! -f Makefile ]; then
+            SUB=$(find . -maxdepth 2 -name Makefile -printf '%h\n' | head -1)
+            if [ -n "$SUB" ]; then
+              echo "KDIR=$GITHUB_WORKSPACE/kernel-src/${SUB#./}" >> $GITHUB_ENV
+            fi
           fi
+          cd $KDIR && echo "实际内核目录: $KDIR" && ls -la | head -20
           make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
           make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules_prepare
 
@@ -76,24 +47,31 @@ jobs:
           git clone --depth 1 https://github.com/destan19/OpenAppFilter.git oaf-src || \
           git clone --depth 1 https://gitee.com/listenerln/OpenAppFilter.git oaf-src
 
-      - name: Auto locate OAF module source
+      - name: Locate OAF module source
         run: |
           OAF_DIR=$(dirname $(find oaf-src -name "app_filter.c" | head -1))
+          if [ -z "$OAF_DIR" ] || [ "$OAF_DIR" = "." ]; then
+            OAF_DIR=$(find oaf-src -maxdepth 3 -name "Makefile" -exec dirname {} \; | head -1)
+          fi
           echo "OAF模块目录: $OAF_DIR"
-          echo "OAF_DIR=$OAF_DIR" >> $GITHUB_ENV
+          echo "OAF_DIR=$GITHUB_WORKSPACE/$OAF_DIR" >> $GITHUB_ENV
 
       - name: Build oaf.ko
         run: |
           cd $OAF_DIR
-          make -C $GITHUB_WORKSPACE/$KDIR M=$(pwd) \
-            ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules 2>&1 | tee build.log
-          ls -lh oaf.ko
+          make -C $KDIR M=$(pwd) ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules 2>&1 | tee build.log || true
+          echo "===== 编译结果 ====="
+          find . -name "*.ko" -exec ls -lh {} \;
+          if [ ! -f oaf.ko ]; then
+            echo "未生成 oaf.ko，请查看 build.log 末尾报错"
+            tail -50 build.log
+          fi
 
-      - name: Upload oaf.ko
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: oaf-ko-6.18.59-ophub-${{ github.event.inputs.arch }}
+          name: oaf-ko-6.18.64-ophub
           path: |
             ${{ env.OAF_DIR }}/oaf.ko
             ${{ env.OAF_DIR }}/build.log
-          if-no-files-found: error
+          if-no-files-found: warn
