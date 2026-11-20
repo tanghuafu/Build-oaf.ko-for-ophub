@@ -30,15 +30,29 @@ jobs:
 
       - name: Prepare kernel build environment
         run: |
-          cd $KDIR
-          # 若解压后多一层目录，自动进入真正的内核根
-          if [ ! -f Makefile ]; then
-            SUB=$(find . -maxdepth 2 -name Makefile -printf '%h\n' | head -1)
-            if [ -n "$SUB" ]; then
-              echo "KDIR=$GITHUB_WORKSPACE/kernel-src/${SUB#./}" >> $GITHUB_ENV
-            fi
+          # 直接定位含顶层 Makefile 和 include/linux 的真正内核根
+          KDIR=$(find kernel-src -type f -name Makefile -path "*6.18.64*" \
+            -exec dirname {} \; | while read d; do
+              if [ -d "$d/include/linux" ] && grep -q "^VERSION" "$d/Makefile"; then
+                echo "$d"; break
+              fi
+            done)
+          if [ -z "$KDIR" ]; then
+            echo "未找到内核根目录，目录结构如下："
+            find kernel-src -maxdepth 3 | head -80
+            exit 1
           fi
-          cd $KDIR && echo "实际内核目录: $KDIR" && ls -la | head -20
+          echo "真正的内核目录: $KDIR"
+          echo "KDIR=$GITHUB_WORKSPACE/$KDIR" >> $GITHUB_ENV
+
+          cd "$GITHUB_WORKSPACE/$KDIR"
+          echo "===== 内核根目录内容 ====="
+          ls -la | head -25
+
+          # 没有 .config 时用 arm64 默认配置
+          if [ ! -f .config ]; then
+            make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE defconfig
+          fi
           make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE olddefconfig
           make ARCH=$KERNEL_ARCH CROSS_COMPILE=$CROSS_COMPILE modules_prepare
 
